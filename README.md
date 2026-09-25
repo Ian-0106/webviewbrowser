@@ -9,6 +9,7 @@
 ## 功能
 
 - **多标签浏览**：`+` 新建标签、点击切换、`×` 关闭（带悬停与按下反馈）
+- **键盘快捷键**：`Ctrl+T` / `Ctrl+W` / `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+L`，**在网页内部同样生效**
 - **标签标题自动同步**：跟随网页标题更新（WebView2 `DocumentTitleChanged`）
 - **地址栏自动同步**：页面跳转后自动更新（WebView2 `SourceChanged`）
 - **跳转**：地址栏内按回车，或点击「转到」按钮
@@ -54,14 +55,17 @@ Release 构建：
 
 | 按键 | 作用 |
 |---|---|
+| `Ctrl + T` | 新建标签页 |
+| `Ctrl + W` | 关闭当前标签页 |
+| `Ctrl + Tab` | 下一个标签页 |
+| `Ctrl + Shift + Tab` | 上一个标签页 |
+| `Ctrl + L` | 聚焦地址栏并全选内容 |
 | `Enter`（地址栏内） | 打开输入的地址 |
-
-> 常用快捷键（`Ctrl+T` / `Ctrl+W` / `Ctrl+Tab` / `Ctrl+L` / `F5`）尚未实现，见下方 TODO。
 
 ## 目录结构
 
     .
-    ├── main.cpp            # 主程序：窗口、标签栏自绘、WebView2 事件绑定
+    ├── main.cpp            # 主程序：窗口、标签栏自绘、WebView2 事件绑定、快捷键
     ├── webview.h           # WebView2 的 C++ 封装（第三方）
     ├── WebView2.h          # Microsoft WebView2 SDK 头文件
     ├── CMakeLists.txt      # 构建脚本（C++17 + /utf-8）
@@ -74,10 +78,17 @@ Release 构建：
 - **Win32 自绘界面**：标签栏与工具栏通过 `WM_PAINT` + GDI 绘制，配色由一组 `COLORREF` 常量定义；鼠标交互通过 `HitKind` 枚举（含 `HIT_CLOSE` 等）配合 `g_tabGeom` 中的命中矩形判断
 - **WebView2 集成**：`webview_create()` 为每个标签创建实例，`webview_get_native_handle()` 取出原生窗口句柄后嵌入自绘的标签区域
 - **事件绑定**：`NewWindowRequested` → 新标签；`DocumentTitleChanged` → 标签标题；`SourceChanged` → 地址栏同步
+- **快捷键的两条通路**：
+  - 焦点在自绘控件（标签栏 / 地址栏）时，由 `HACCEL` + `TranslateAccelerator` 在主消息循环中拦截；
+  - 焦点在网页内部时，按键不会进入本进程的消息队列，改由 WebView2 的 `AcceleratorKeyPressed` 事件接管；
+  - 两条通路最终都 `PostMessage(WM_COMMAND)` 到主窗口，动作只有一份实现
+
+## 已知行为
+
+- 关闭**最后一个**标签页会退出程序（如需改成自动新建空白页，见 `CloseTab()`）
 
 ## TODO
 
-- [ ] 常用键盘快捷键（`Ctrl+T` / `Ctrl+W` / `Ctrl+Tab` / `Ctrl+L` / `F5`）
 - [ ] 前进 / 后退 / 刷新按钮
 - [ ] 标签拖拽排序
 - [ ] 深色主题
