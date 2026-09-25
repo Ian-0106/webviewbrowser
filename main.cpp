@@ -138,20 +138,6 @@ static int g_hoverIdx = -1;
 static HitKind g_pressKind = HIT_NONE;
 static int g_pressIdx = -1;
 
-static std::wstring Utf8ToWide(const char *s) {
-    if (!s) {
-        return L"";
-    }
-    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
-    if (len <= 0) {
-        return L"";
-    }
-    std::wstring out(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s, -1, &out[0], len);
-    out.pop_back();
-    return out;
-}
-
 static std::string WideToUtf8(const std::wstring &s) {
     if (s.empty()) {
         return "";
