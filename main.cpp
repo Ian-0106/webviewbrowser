@@ -17,6 +17,10 @@
 #define ID_ADDRESS        2001
 #define ID_GO             2002
 #define ID_PLUS           2003
+#define ID_CLOSE_CURRENT  2004
+#define ID_NEXT_TAB       2005
+#define ID_PREV_TAB       2006
+#define ID_FOCUS_ADDRESS  2007
 #define ID_TAB_BASE       4000
 #define ID_TAB_CLOSE_BASE 5000
 
@@ -44,6 +48,7 @@ struct Tab {
     EventRegistrationToken nwToken{};
     EventRegistrationToken titleToken{};
     EventRegistrationToken sourceToken{};
+    EventRegistrationToken akToken{};
 };
 
 struct TabGeom {
@@ -115,6 +120,7 @@ static HWND g_tabStrip;
 static HWND g_toolbar;
 static HWND g_container;
 static HWND g_addressEdit;
+static HACCEL g_hAccel = nullptr;
 static HFONT g_font;
 static HFONT g_boldFont;
 static HBRUSH g_boxBrush;
@@ -294,7 +300,50 @@ private:
     webview_t m_w;
     ICoreWebView2 *m_core;
 };
+class AcceleratorKeyPressedHandler
+    : public ComHandlerBase<ICoreWebView2AcceleratorKeyPressedEventHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE
+        Invoke(ICoreWebView2Controller*,
+            ICoreWebView2AcceleratorKeyPressedEventArgs* args) override {
+        COREWEBVIEW2_KEY_EVENT_KIND kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+        if (FAILED(args->get_KeyEventKind(&kind))) {
+            return S_OK;
+        }
+        if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+            kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN) {
+            return S_OK;
+        }
 
+        UINT vk = 0;
+        if (FAILED(args->get_VirtualKey(&vk))) {
+            return S_OK;
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) == 0) {
+            return S_OK;
+        }
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+        UINT cmd = 0;
+        if (vk == 'T') {
+            cmd = ID_PLUS;
+        }
+        else if (vk == 'W') {
+            cmd = ID_CLOSE_CURRENT;
+        }
+        else if (vk == 'L') {
+            cmd = ID_FOCUS_ADDRESS;
+        }
+        else if (vk == VK_TAB) {
+            cmd = shift ? ID_PREV_TAB : ID_NEXT_TAB;
+        }
+        if (cmd != 0) {
+            PostMessageW(g_mainWnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+            args->put_Handled(TRUE);
+        }
+        return S_OK;
+    }
+};
 static int MeasureTabWidth(std::wstring_view text) {
     HDC dc = GetDC(g_mainWnd);
     HFONT oldFont = (HFONT)SelectObject(dc, g_boldFont);
@@ -746,7 +795,11 @@ static void CreateTab(const std::wstring &url) {
     auto *controller = (ICoreWebView2Controller *)webview_get_native_handle(
         tab.w, WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER);
     if (controller) {
-        ICoreWebView2 *core = nullptr;
+        auto* ak = new AcceleratorKeyPressedHandler();
+        controller->add_AcceleratorKeyPressed(ak, &g_tabs[idx].akToken);
+        ak->Release();
+
+        ICoreWebView2* core = nullptr;
         if (SUCCEEDED(controller->get_CoreWebView2(&core))) {
             auto *nw = new NewWindowRequestedHandler();
             core->add_NewWindowRequested(nw, &g_tabs[idx].nwToken);
@@ -867,9 +920,31 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id >= ID_TAB_CLOSE_BASE &&
                    id < ID_TAB_CLOSE_BASE + (int)g_tabs.size()) {
             CloseTab(id - ID_TAB_CLOSE_BASE);
-        } else if (id == IDM_ABOUT) {
+        }
+        else if (id == ID_CLOSE_CURRENT) {
+            if (g_activeTab >= 0 && g_activeTab < (int)g_tabs.size()) {
+                CloseTab(g_activeTab);
+            }
+        }
+        else if (id == ID_NEXT_TAB) {
+            int n = (int)g_tabs.size();
+            if (n > 1) {
+                ActivateTab((g_activeTab + 1) % n);
+            }
+        }
+        else if (id == ID_PREV_TAB) {
+            int n = (int)g_tabs.size();
+            if (n > 1) {
+                ActivateTab((g_activeTab - 1 + n) % n);
+            }
+        }
+        else if (id == ID_FOCUS_ADDRESS) {
+            SetFocus(g_addressEdit);
+            SendMessageW(g_addressEdit, EM_SETSEL, 0, -1);
+        }
+        else if (id == IDM_ABOUT) {
             MessageBoxW(hwnd, L"WebView Browser\nVersion 1.2.0", L"About",
-                        MB_OK | MB_ICONINFORMATION);
+                MB_OK | MB_ICONINFORMATION);
         }
         break;
     }
@@ -945,15 +1020,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return 1;
     }
 
+    ACCEL accels[] = {
+        {FVIRTKEY | FCONTROL,          'T',    ID_PLUS},
+        {FVIRTKEY | FCONTROL,          'W',    ID_CLOSE_CURRENT},
+        {FVIRTKEY | FCONTROL,          VK_TAB, ID_NEXT_TAB},
+        {FVIRTKEY | FCONTROL | FSHIFT, VK_TAB, ID_PREV_TAB},
+        {FVIRTKEY | FCONTROL,          'L',    ID_FOCUS_ADDRESS},
+    };
+    g_hAccel = CreateAcceleratorTableW(accels, ARRAYSIZE(accels));
+
     ShowWindow(g_mainWnd, nCmdShow);
     UpdateWindow(g_mainWnd);
 
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        if (!TranslateAcceleratorW(g_mainWnd, g_hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+
+    if (g_hAccel) {
+        DestroyAcceleratorTable(g_hAccel);
+        g_hAccel = nullptr;
     }
 
     CoUninitialize();
     return (int)msg.wParam;
+
 }
