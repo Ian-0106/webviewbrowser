@@ -1,19 +1,37 @@
+#define UNICODE
+#define _UNICODE
 #define WIN32_LEAN_AND_MEAN
 #define WEBVIEW_IMPLEMENTATION
 #include "webview.h"
+#include "activity_store.h"
+#include "notification_manager.h"
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <objbase.h>
+#include <roapi.h>
+#include <shellapi.h>
 #include <algorithm>
+#include <cwctype>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#if defined(_MSC_VER)
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#endif
+
 #define APP_NAME    L"WebView Browser"
-#define APP_VERSION L"1.2.0"
+#define APP_VERSION L"1.3.0"
 
 #define IDM_ABOUT         1001
+#define IDM_HISTORY       1002
+#define IDM_DOWNLOADS     1003
 #define ID_ADDRESS        2001
 #define ID_GO             2002
 #define ID_PLUS           2003
@@ -21,10 +39,23 @@
 #define ID_NEXT_TAB       2005
 #define ID_PREV_TAB       2006
 #define ID_FOCUS_ADDRESS  2007
+#define ID_OPEN_HISTORY   2008
+#define ID_OPEN_DOWNLOADS 2009
 #define ID_TAB_BASE       4000
 #define ID_TAB_CLOSE_BASE 5000
+#define IDA_HISTORY_TAB   6001
+#define IDA_DOWNLOADS_TAB 6002
+#define IDA_SEARCH        6003
+#define IDA_FILTER        6004
+#define IDA_LIST          6005
+#define IDA_PRIMARY       6006
+#define IDA_SECONDARY     6007
+#define IDA_DELETE        6008
+#define IDA_CLEAR         6009
 
 #define WM_APP_NEWTAB (WM_APP + 1)
+#define WM_APP_ACTIVITY_REFRESH (WM_APP + 2)
+#define WM_APP_TOAST_ACTIVATED (WM_APP + 3)
 
 static const COLORREF kStripBg    = RGB(0xF0, 0xF0, 0xF3);
 static const COLORREF kActiveTab  = RGB(0xFF, 0xFF, 0xFF);
@@ -49,6 +80,19 @@ struct Tab {
     EventRegistrationToken titleToken{};
     EventRegistrationToken sourceToken{};
     EventRegistrationToken akToken{};
+    EventRegistrationToken navigationToken{};
+    EventRegistrationToken downloadToken{};
+    std::wstring lastHistoryId;
+};
+
+struct DownloadRuntime {
+    std::wstring id;
+    ICoreWebView2DownloadOperation *operation = nullptr;
+    EventRegistrationToken bytesToken{};
+    EventRegistrationToken stateToken{};
+    bool paused = false;
+    bool notified = false;
+    std::int64_t lastPersistAt = 0;
 };
 
 struct TabGeom {
@@ -111,7 +155,9 @@ enum HitKind {
     HIT_TAB,
     HIT_CLOSE,
     HIT_PLUS,
-    HIT_GO
+    HIT_GO,
+    HIT_HISTORY,
+    HIT_DOWNLOADS
 };
 
 static HINSTANCE g_hInstance;
@@ -120,6 +166,16 @@ static HWND g_tabStrip;
 static HWND g_toolbar;
 static HWND g_container;
 static HWND g_addressEdit;
+static HWND g_activityWnd;
+static HWND g_activityHistoryButton;
+static HWND g_activityDownloadsButton;
+static HWND g_activitySearch;
+static HWND g_activityFilter;
+static HWND g_activityList;
+static HWND g_activityPrimary;
+static HWND g_activitySecondary;
+static HWND g_activityDelete;
+static HWND g_activityClear;
 static HACCEL g_hAccel = nullptr;
 static HFONT g_font;
 static HFONT g_boldFont;
@@ -133,7 +189,16 @@ static std::vector<TabGeom> g_tabGeom;
 static RECT g_plusRc{};
 static RECT g_boxRc{};
 static RECT g_goRc{};
+static RECT g_historyRc{};
+static RECT g_downloadsRc{};
 static int g_activeTab = -1;
+static bool g_activityDownloadsMode = false;
+static bool g_allowClose = false;
+
+static ActivityStore g_activityStore(DefaultActivityStorePath());
+static std::map<std::wstring, std::unique_ptr<DownloadRuntime>> g_downloadRuntime;
+static std::map<std::wstring, std::vector<std::wstring>> g_pendingRetries;
+static std::vector<std::wstring> g_activityVisibleIds;
 
 static float g_scale = 1.0f;
 static int g_stripH = 38;
@@ -194,6 +259,29 @@ static int FindTabIndex(webview_t w) {
 
 static void RefreshTabStrip(bool recomputeLayout = false);
 static void UpdateWindowTitle();
+static void CreateTab(const std::wstring &url);
+static void OpenActivityWindow(bool downloads, const std::wstring &highlightId = L"");
+static void RefreshActivityWindow();
+static void UpdateDownloadOperation(const std::wstring &id,
+                                    ICoreWebView2DownloadOperation *operation);
+
+static DownloadRuntime *FindDownloadRuntime(const std::wstring &id) {
+    auto item = g_downloadRuntime.find(id);
+    return item == g_downloadRuntime.end() ? nullptr : item->second.get();
+}
+
+static std::wstring Lowercase(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return value;
+}
+
+static std::wstring FileNameFromPath(const std::wstring &path) {
+    if (path.empty()) return L"download";
+    std::filesystem::path value(path);
+    return value.filename().wstring().empty() ? L"download" : value.filename().wstring();
+}
 
 static std::wstring_view TabLabel(const Tab &tab) {
     return tab.title.empty() ? kNewTabTitle : std::wstring_view(tab.title);
@@ -258,6 +346,13 @@ public:
             LPWSTR title = nullptr;
             if (SUCCEEDED(m_core->get_DocumentTitle(&title)) && title) {
                 g_tabs[idx].title = title;
+                if (!g_tabs[idx].lastHistoryId.empty()) {
+                    g_activityStore.UpdateHistoryTitle(g_tabs[idx].lastHistoryId,
+                                                       g_tabs[idx].title);
+                    if (g_activityWnd) {
+                        PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
+                    }
+                }
                 CoTaskMemFree(title);
                 RefreshTabStrip(true);
                 UpdateWindowTitle();
@@ -281,7 +376,7 @@ public:
     ~SourceChangedHandler() override { m_core->Release(); }
 
     HRESULT STDMETHODCALLTYPE
-    Invoke(ICoreWebView2 *, ICoreWebView2SourceChangedEventArgs *) override {
+    Invoke(ICoreWebView2 *, ICoreWebView2SourceChangedEventArgs *args) override {
         int idx = FindTabIndex(m_w);
         if (idx >= 0) {
             LPWSTR src = nullptr;
@@ -290,6 +385,19 @@ public:
                 CoTaskMemFree(src);
                 if (idx == g_activeTab) {
                     SetWindowTextW(g_addressEdit, g_tabs[idx].url.c_str());
+                }
+                BOOL isNewDocument = TRUE;
+                if (SUCCEEDED(args->get_IsNewDocument(&isNewDocument)) && !isNewDocument) {
+                    LPWSTR title = nullptr;
+                    m_core->get_DocumentTitle(&title);
+                    g_tabs[idx].lastHistoryId = g_activityStore.RecordHistory(
+                        reinterpret_cast<std::uintptr_t>(m_w), g_tabs[idx].url,
+                        title ? title : g_tabs[idx].url,
+                        ActivityStore::NowMilliseconds());
+                    if (title) CoTaskMemFree(title);
+                    if (g_activityWnd) {
+                        PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
+                    }
                 }
             }
         }
@@ -300,6 +408,119 @@ private:
     webview_t m_w;
     ICoreWebView2 *m_core;
 };
+
+class NavigationCompletedHandler
+    : public ComHandlerBase<ICoreWebView2NavigationCompletedEventHandler> {
+public:
+    NavigationCompletedHandler(webview_t w, ICoreWebView2 *core)
+        : m_w(w), m_core(core) {
+        m_core->AddRef();
+    }
+    ~NavigationCompletedHandler() override { m_core->Release(); }
+
+    HRESULT STDMETHODCALLTYPE
+    Invoke(ICoreWebView2 *, ICoreWebView2NavigationCompletedEventArgs *args) override {
+        BOOL success = FALSE;
+        if (FAILED(args->get_IsSuccess(&success)) || !success) return S_OK;
+        const int idx = FindTabIndex(m_w);
+        if (idx < 0) return S_OK;
+        LPWSTR source = nullptr;
+        LPWSTR title = nullptr;
+        if (SUCCEEDED(m_core->get_Source(&source)) && source) {
+            m_core->get_DocumentTitle(&title);
+            g_tabs[idx].lastHistoryId = g_activityStore.RecordHistory(
+                reinterpret_cast<std::uintptr_t>(m_w), source,
+                title ? title : source, ActivityStore::NowMilliseconds());
+            CoTaskMemFree(source);
+            if (title) CoTaskMemFree(title);
+            if (g_activityWnd) {
+                PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
+            }
+        }
+        return S_OK;
+    }
+
+private:
+    webview_t m_w;
+    ICoreWebView2 *m_core;
+};
+
+class DownloadBytesChangedHandler
+    : public ComHandlerBase<ICoreWebView2BytesReceivedChangedEventHandler> {
+public:
+    explicit DownloadBytesChangedHandler(std::wstring id) : id_(std::move(id)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2DownloadOperation *sender,
+                                     IUnknown *) override {
+        UpdateDownloadOperation(id_, sender);
+        return S_OK;
+    }
+private:
+    std::wstring id_;
+};
+
+class DownloadStateChangedHandler
+    : public ComHandlerBase<ICoreWebView2StateChangedEventHandler> {
+public:
+    explicit DownloadStateChangedHandler(std::wstring id) : id_(std::move(id)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2DownloadOperation *sender,
+                                     IUnknown *) override {
+        UpdateDownloadOperation(id_, sender);
+        return S_OK;
+    }
+private:
+    std::wstring id_;
+};
+
+class DownloadStartingHandler
+    : public ComHandlerBase<ICoreWebView2DownloadStartingEventHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE
+    Invoke(ICoreWebView2 *, ICoreWebView2DownloadStartingEventArgs *args) override {
+        ICoreWebView2DownloadOperation *operation = nullptr;
+        if (FAILED(args->get_DownloadOperation(&operation)) || !operation) return S_OK;
+
+        LPWSTR uri = nullptr;
+        LPWSTR resultPath = nullptr;
+        operation->get_Uri(&uri);
+        args->get_ResultFilePath(&resultPath);
+        INT64 total = 0;
+        operation->get_TotalBytesToReceive(&total);
+
+        DownloadEntry entry;
+        entry.url = uri ? uri : L"";
+        entry.savePath = resultPath ? resultPath : L"";
+        entry.filename = FileNameFromPath(entry.savePath);
+        entry.state = L"progressing";
+        entry.totalBytes = total;
+        entry.startedAt = ActivityStore::NowMilliseconds();
+        auto pending = g_pendingRetries.find(entry.url);
+        if (pending != g_pendingRetries.end() && !pending->second.empty()) {
+            entry.retryOf = pending->second.front();
+            pending->second.erase(pending->second.begin());
+            if (pending->second.empty()) g_pendingRetries.erase(pending);
+        }
+        entry.id = ActivityStore::NewId();
+        const std::wstring id = g_activityStore.AddDownload(entry);
+
+        auto runtime = std::make_unique<DownloadRuntime>();
+        runtime->id = id;
+        runtime->operation = operation;
+        auto *bytes = new DownloadBytesChangedHandler(id);
+        operation->add_BytesReceivedChanged(bytes, &runtime->bytesToken);
+        bytes->Release();
+        auto *state = new DownloadStateChangedHandler(id);
+        operation->add_StateChanged(state, &runtime->stateToken);
+        state->Release();
+        g_downloadRuntime[id] = std::move(runtime);
+
+        if (uri) CoTaskMemFree(uri);
+        if (resultPath) CoTaskMemFree(resultPath);
+        if (g_activityWnd) PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
+        InvalidateRect(g_toolbar, nullptr, FALSE);
+        return S_OK;
+    }
+};
+
 class AcceleratorKeyPressedHandler
     : public ComHandlerBase<ICoreWebView2AcceleratorKeyPressedEventHandler> {
 public:
@@ -334,6 +555,12 @@ public:
         else if (vk == 'L') {
             cmd = ID_FOCUS_ADDRESS;
         }
+        else if (vk == 'H') {
+            cmd = ID_OPEN_HISTORY;
+        }
+        else if (vk == 'J') {
+            cmd = ID_OPEN_DOWNLOADS;
+        }
         else if (vk == VK_TAB) {
             cmd = shift ? ID_PREV_TAB : ID_NEXT_TAB;
         }
@@ -344,6 +571,540 @@ public:
         return S_OK;
     }
 };
+
+static std::wstring FormatBytes(std::int64_t value) {
+    if (value <= 0) return L"Unknown";
+    const wchar_t *units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+    double amount = static_cast<double>(value);
+    int unit = 0;
+    while (amount >= 1024.0 && unit < 4) {
+        amount /= 1024.0;
+        ++unit;
+    }
+    wchar_t buffer[64];
+    swprintf_s(buffer, unit == 0 || amount >= 10.0 ? L"%.0f %s" : L"%.1f %s",
+               amount, units[unit]);
+    return buffer;
+}
+
+static SYSTEMTIME LocalSystemTimeFromUnixMilliseconds(std::int64_t value) {
+    ULARGE_INTEGER ticks{};
+    ticks.QuadPart = static_cast<ULONGLONG>(value + 11644473600000LL) * 10000ULL;
+    FILETIME utc{ticks.LowPart, ticks.HighPart};
+    FILETIME local{};
+    SYSTEMTIME result{};
+    FileTimeToLocalFileTime(&utc, &local);
+    FileTimeToSystemTime(&local, &result);
+    return result;
+}
+
+static std::wstring FormatTimestamp(std::int64_t value) {
+    if (value <= 0) return L"";
+    SYSTEMTIME time = LocalSystemTimeFromUnixMilliseconds(value);
+    wchar_t date[64]{};
+    wchar_t clock[64]{};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &time, nullptr,
+                    date, ARRAYSIZE(date), nullptr);
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &time, nullptr,
+                    clock, ARRAYSIZE(clock));
+    return std::wstring(date) + L" " + clock;
+}
+
+static std::wstring DayGroupLabel(std::int64_t value) {
+    SYSTEMTIME item = LocalSystemTimeFromUnixMilliseconds(value);
+    SYSTEMTIME today{};
+    GetLocalTime(&today);
+    if (item.wYear == today.wYear && item.wMonth == today.wMonth && item.wDay == today.wDay) {
+        return L"Today";
+    }
+    FILETIME todayFt{};
+    SystemTimeToFileTime(&today, &todayFt);
+    ULARGE_INTEGER raw{todayFt.dwLowDateTime, todayFt.dwHighDateTime};
+    raw.QuadPart -= 24ULL * 60 * 60 * 10000000ULL;
+    FILETIME yesterdayFt{raw.LowPart, raw.HighPart};
+    SYSTEMTIME yesterday{};
+    FileTimeToSystemTime(&yesterdayFt, &yesterday);
+    if (item.wYear == yesterday.wYear && item.wMonth == yesterday.wMonth && item.wDay == yesterday.wDay) {
+        return L"Yesterday";
+    }
+    wchar_t date[96]{};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &item, nullptr,
+                    date, ARRAYSIZE(date), nullptr);
+    return date;
+}
+
+static bool FileExists(const std::wstring &path) {
+    return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void ShowDownloadNotification(const DownloadEntry &entry) {
+    const bool completed = entry.state == L"completed";
+    if (ShowNativeDownloadNotification(entry.id, entry.filename, entry.totalBytes,
+                                       completed, entry.interruptReason)) {
+        return;
+    }
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_mainWnd;
+    data.uID = 1;
+    data.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
+    data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(data.szTip, APP_NAME);
+    wcscpy_s(data.szInfoTitle, completed ? L"Download complete" : L"Download failed");
+    std::wstring message = entry.filename;
+    if (completed && entry.totalBytes > 0) message += L" (" + FormatBytes(entry.totalBytes) + L")";
+    if (!completed && !entry.interruptReason.empty()) message += L": " + entry.interruptReason;
+    wcsncpy_s(data.szInfo, message.c_str(), _TRUNCATE);
+    data.dwInfoFlags = completed ? NIIF_INFO : NIIF_ERROR;
+    Shell_NotifyIconW(NIM_ADD, &data);
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+static void UpdateDownloadOperation(const std::wstring &id,
+                                    ICoreWebView2DownloadOperation *operation) {
+    DownloadEntry *entry = g_activityStore.FindDownload(id);
+    DownloadRuntime *runtime = FindDownloadRuntime(id);
+    if (!entry || !operation || !runtime) return;
+    operation->get_BytesReceived(&entry->receivedBytes);
+    operation->get_TotalBytesToReceive(&entry->totalBytes);
+    LPWSTR resultPath = nullptr;
+    if (SUCCEEDED(operation->get_ResultFilePath(&resultPath)) && resultPath) {
+        entry->savePath = resultPath;
+        entry->filename = FileNameFromPath(entry->savePath);
+        CoTaskMemFree(resultPath);
+    }
+    COREWEBVIEW2_DOWNLOAD_STATE state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+    if (SUCCEEDED(operation->get_State(&state))) {
+        if (runtime->paused) {
+            entry->state = L"paused";
+        } else if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
+            entry->state = L"completed";
+        } else if (state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED) {
+            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NONE;
+            operation->get_InterruptReason(&reason);
+            entry->state = reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED
+                               ? L"cancelled"
+                               : L"failed";
+            entry->interruptReason = L"WebView2 interruption code " + std::to_wstring(static_cast<int>(reason));
+        } else {
+            entry->state = L"progressing";
+        }
+    }
+    const bool isActive = ActivityStore::IsActiveDownloadState(entry->state);
+    if (!isActive && !entry->finishedAt) {
+        entry->finishedAt = ActivityStore::NowMilliseconds();
+    }
+    const std::int64_t now = ActivityStore::NowMilliseconds();
+    if (isActive && runtime->lastPersistAt && now - runtime->lastPersistAt < 250) {
+        return;
+    }
+    runtime->lastPersistAt = now;
+    g_activityStore.Save();
+    if (!isActive && !runtime->notified &&
+        (entry->state == L"completed" || entry->state == L"failed")) {
+        runtime->notified = true;
+        ShowDownloadNotification(*entry);
+    }
+    if (g_activityWnd) PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
+    InvalidateRect(g_toolbar, nullptr, FALSE);
+    if (!isActive) {
+        operation->remove_BytesReceivedChanged(runtime->bytesToken);
+        operation->remove_StateChanged(runtime->stateToken);
+        operation->Release();
+        runtime->operation = nullptr;
+        g_downloadRuntime.erase(id);
+    }
+}
+
+static void ConfigureActivityColumns(bool downloads) {
+    while (ListView_DeleteColumn(g_activityList, 0)) {}
+    struct Column { const wchar_t *title; int width; };
+    const Column historyColumns[] = {{L"Title", 250}, {L"URL", 390}, {L"Visited", 150}};
+    const Column downloadColumns[] = {{L"File", 210}, {L"Status", 90}, {L"Progress", 105},
+                                      {L"Size", 90}, {L"Started", 140}, {L"Location", 280}};
+    const Column *columns = downloads ? downloadColumns : historyColumns;
+    const int count = downloads ? ARRAYSIZE(downloadColumns) : ARRAYSIZE(historyColumns);
+    for (int index = 0; index < count; ++index) {
+        LVCOLUMNW column{};
+        column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        column.pszText = const_cast<LPWSTR>(columns[index].title);
+        column.cx = columns[index].width;
+        column.iSubItem = index;
+        ListView_InsertColumn(g_activityList, index, &column);
+    }
+}
+
+static void SetListCell(int row, int column, const std::wstring &value) {
+    ListView_SetItemText(g_activityList, row, column, const_cast<LPWSTR>(value.c_str()));
+}
+
+static std::wstring ActivitySearchText() {
+    int length = GetWindowTextLengthW(g_activitySearch);
+    std::wstring value(static_cast<std::size_t>(length) + 1, L'\0');
+    if (length) GetWindowTextW(g_activitySearch, value.data(), length + 1);
+    value.resize(static_cast<std::size_t>(length));
+    return Lowercase(std::move(value));
+}
+
+static bool ContainsSearch(const std::wstring &haystack, const std::wstring &query) {
+    return query.empty() || Lowercase(haystack).find(query) != std::wstring::npos;
+}
+
+static void RefreshActivityWindow() {
+    if (!g_activityWnd || !g_activityList) return;
+    ListView_DeleteAllItems(g_activityList);
+    ListView_RemoveAllGroups(g_activityList);
+    g_activityVisibleIds.clear();
+    ConfigureActivityColumns(g_activityDownloadsMode);
+    const std::wstring query = ActivitySearchText();
+
+    ShowWindow(g_activityFilter, g_activityDownloadsMode ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(g_activityHistoryButton, g_activityDownloadsMode ? L"History" : L"History *");
+    SetWindowTextW(g_activityDownloadsButton, g_activityDownloadsMode ? L"Downloads *" : L"Downloads");
+    SetWindowTextW(g_activityDelete, g_activityDownloadsMode ? L"Delete record" : L"Delete selected");
+    SetWindowTextW(g_activityClear, g_activityDownloadsMode ? L"Clear finished" : L"Clear history");
+
+    if (!g_activityDownloadsMode) {
+        SetWindowTextW(g_activityPrimary, L"Open");
+        ShowWindow(g_activityPrimary, SW_SHOW);
+        ShowWindow(g_activitySecondary, SW_HIDE);
+        ListView_EnableGroupView(g_activityList, TRUE);
+        std::map<std::wstring, int> groups;
+        int nextGroup = 1;
+        for (const auto &entry : g_activityStore.History()) {
+            if (!ContainsSearch(entry.title + L" " + entry.url, query)) continue;
+            const std::wstring label = DayGroupLabel(entry.visitedAt);
+            int groupId = 0;
+            auto found = groups.find(label);
+            if (found == groups.end()) {
+                groupId = nextGroup++;
+                groups[label] = groupId;
+                LVGROUP group{};
+                group.cbSize = sizeof(group);
+                group.mask = LVGF_HEADER | LVGF_GROUPID;
+                group.pszHeader = const_cast<LPWSTR>(label.c_str());
+                group.iGroupId = groupId;
+                ListView_InsertGroup(g_activityList, -1, &group);
+            } else {
+                groupId = found->second;
+            }
+            LVITEMW item{};
+            item.mask = LVIF_TEXT | LVIF_GROUPID;
+            item.iItem = ListView_GetItemCount(g_activityList);
+            item.iGroupId = groupId;
+            item.pszText = const_cast<LPWSTR>(entry.title.c_str());
+            const int row = ListView_InsertItem(g_activityList, &item);
+            SetListCell(row, 1, entry.url);
+            SetListCell(row, 2, FormatTimestamp(entry.visitedAt));
+            g_activityVisibleIds.push_back(entry.id);
+        }
+    } else {
+        ListView_EnableGroupView(g_activityList, FALSE);
+        const int filter = ComboBox_GetCurSel(g_activityFilter);
+        for (const auto &entry : g_activityStore.Downloads()) {
+            bool matches = filter <= 0 ||
+                (filter == 1 && ActivityStore::IsActiveDownloadState(entry.state)) ||
+                (filter == 2 && entry.state == L"completed") ||
+                (filter == 3 && (entry.state == L"failed" || entry.state == L"interrupted" || entry.state == L"cancelled"));
+            if (!matches || !ContainsSearch(entry.filename + L" " + entry.url, query)) continue;
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = ListView_GetItemCount(g_activityList);
+            item.pszText = const_cast<LPWSTR>(entry.filename.c_str());
+            const int row = ListView_InsertItem(g_activityList, &item);
+            SetListCell(row, 1, entry.state);
+            std::wstring progress = entry.totalBytes > 0
+                ? std::to_wstring((entry.receivedBytes * 100) / entry.totalBytes) + L"%"
+                : FormatBytes(entry.receivedBytes);
+            SetListCell(row, 2, progress);
+            SetListCell(row, 3, FormatBytes(entry.totalBytes));
+            SetListCell(row, 4, FormatTimestamp(entry.startedAt));
+            SetListCell(row, 5, FileExists(entry.savePath) || ActivityStore::IsActiveDownloadState(entry.state)
+                                     ? entry.savePath
+                                     : L"File missing - " + entry.savePath);
+            g_activityVisibleIds.push_back(entry.id);
+        }
+        ShowWindow(g_activityPrimary, SW_SHOW);
+        ShowWindow(g_activitySecondary, SW_SHOW);
+    }
+}
+
+static std::vector<std::wstring> SelectedActivityIds() {
+    std::vector<std::wstring> ids;
+    int index = -1;
+    while ((index = ListView_GetNextItem(g_activityList, index, LVNI_SELECTED)) != -1) {
+        if (index >= 0 && index < static_cast<int>(g_activityVisibleIds.size())) {
+            ids.push_back(g_activityVisibleIds[static_cast<std::size_t>(index)]);
+        }
+    }
+    return ids;
+}
+
+enum class DownloadAction { Open, Folder, PauseResume, Cancel, Retry, DeleteRecord, DeleteFile };
+
+static void PerformDownloadAction(const std::wstring &id, DownloadAction action) {
+    DownloadEntry *entry = g_activityStore.FindDownload(id);
+    if (!entry) return;
+    DownloadRuntime *runtime = FindDownloadRuntime(id);
+    if (action == DownloadAction::Open) {
+        if (FileExists(entry->savePath)) ShellExecuteW(g_activityWnd, L"open", entry->savePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        else MessageBoxW(g_activityWnd, L"The downloaded file no longer exists.", L"Downloads", MB_OK | MB_ICONINFORMATION);
+    } else if (action == DownloadAction::Folder) {
+        if (entry->savePath.empty()) return;
+        if (FileExists(entry->savePath)) {
+            std::wstring argument = L"/select,\"" + entry->savePath + L"\"";
+            ShellExecuteW(g_activityWnd, L"open", L"explorer.exe", argument.c_str(), nullptr, SW_SHOWNORMAL);
+        } else {
+            ShellExecuteW(g_activityWnd, L"open", std::filesystem::path(entry->savePath).parent_path().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    } else if (action == DownloadAction::PauseResume && runtime && runtime->operation) {
+        if (runtime->paused) {
+            if (SUCCEEDED(runtime->operation->Resume())) runtime->paused = false;
+        } else {
+            BOOL canResume = FALSE;
+            runtime->operation->get_CanResume(&canResume);
+            if (canResume && SUCCEEDED(runtime->operation->Pause())) runtime->paused = true;
+        }
+        UpdateDownloadOperation(id, runtime->operation);
+    } else if (action == DownloadAction::Cancel && runtime && runtime->operation) {
+        runtime->operation->Cancel();
+    } else if (action == DownloadAction::Retry) {
+        if (!ActivityStore::IsWebUrl(entry->url)) {
+            MessageBoxW(g_activityWnd, L"This download source is not a valid web address.",
+                        L"Downloads", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        g_pendingRetries[entry->url].push_back(entry->id);
+        CreateTab(entry->url);
+    } else if (action == DownloadAction::DeleteRecord) {
+        g_activityStore.RemoveDownloads({id}, true);
+    } else if (action == DownloadAction::DeleteFile) {
+        if (!FileExists(entry->savePath)) {
+            MessageBoxW(g_activityWnd, L"The downloaded file no longer exists.", L"Downloads", MB_OK | MB_ICONINFORMATION);
+        } else if (MessageBoxW(g_activityWnd, L"Move this file to the Recycle Bin and remove its download record?",
+                               L"Delete downloaded file", MB_YESNO | MB_ICONWARNING) == IDYES) {
+            std::wstring from = entry->savePath;
+            from.push_back(L'\0');
+            SHFILEOPSTRUCTW operation{};
+            operation.hwnd = g_activityWnd;
+            operation.wFunc = FO_DELETE;
+            operation.pFrom = from.c_str();
+            operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+            if (SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted) {
+                g_activityStore.RemoveDownloads({id}, false);
+            }
+        }
+    }
+    RefreshActivityWindow();
+}
+
+static void UpdateDownloadButtons() {
+    if (!g_activityDownloadsMode) return;
+    auto ids = SelectedActivityIds();
+    DownloadEntry *entry = ids.size() == 1 ? g_activityStore.FindDownload(ids[0]) : nullptr;
+    EnableWindow(g_activityPrimary, entry != nullptr);
+    EnableWindow(g_activitySecondary, entry != nullptr);
+    EnableWindow(g_activityDelete, !ids.empty());
+    if (!entry) {
+        SetWindowTextW(g_activityPrimary, L"Open");
+        SetWindowTextW(g_activitySecondary, L"More");
+        return;
+    }
+    if (entry->state == L"progressing" || entry->state == L"waiting") {
+        SetWindowTextW(g_activityPrimary, L"Pause");
+        SetWindowTextW(g_activitySecondary, L"Cancel");
+    } else if (entry->state == L"paused") {
+        SetWindowTextW(g_activityPrimary, L"Resume");
+        SetWindowTextW(g_activitySecondary, L"Cancel");
+    } else if (entry->state == L"completed") {
+        SetWindowTextW(g_activityPrimary, L"Open file");
+        SetWindowTextW(g_activitySecondary, L"Open folder");
+    } else {
+        SetWindowTextW(g_activityPrimary, L"Retry");
+        SetWindowTextW(g_activitySecondary, L"Open folder");
+    }
+}
+
+static void LayoutActivityWindow(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const int pad = 14;
+    const int top = 14;
+    MoveWindow(g_activityHistoryButton, pad, top, 100, 32, TRUE);
+    MoveWindow(g_activityDownloadsButton, pad + 108, top, 120, 32, TRUE);
+    MoveWindow(g_activitySearch, pad + 240, top,
+               static_cast<int>((std::max<LONG>)(180, rc.right - 718)), 32, TRUE);
+    MoveWindow(g_activityFilter, rc.right - 456, top, 110, 220, TRUE);
+    MoveWindow(g_activityPrimary, rc.right - 338, top, 100, 32, TRUE);
+    MoveWindow(g_activitySecondary, rc.right - 230, top, 100, 32, TRUE);
+    MoveWindow(g_activityDelete, rc.right - 122, top, 108, 32, TRUE);
+    MoveWindow(g_activityClear, rc.right - 144, rc.bottom - 46, 130, 32, TRUE);
+    MoveWindow(g_activityList, pad, 58, rc.right - pad * 2,
+               static_cast<int>((std::max<LONG>)(80, rc.bottom - 112)), TRUE);
+}
+
+static LRESULT CALLBACK ActivityWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        g_activityHistoryButton = CreateWindowW(L"BUTTON", L"History *", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_HISTORY_TAB, g_hInstance, nullptr);
+        g_activityDownloadsButton = CreateWindowW(L"BUTTON", L"Downloads", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_DOWNLOADS_TAB, g_hInstance, nullptr);
+        g_activitySearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+            (HMENU)IDA_SEARCH, g_hInstance, nullptr);
+        SendMessageW(g_activitySearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search title, URL, or file");
+        g_activityFilter = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | CBS_DROPDOWNLIST,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_FILTER, g_hInstance, nullptr);
+        for (const wchar_t *label : {L"All", L"In progress", L"Completed", L"Failed"}) {
+            ComboBox_AddString(g_activityFilter, label);
+        }
+        ComboBox_SetCurSel(g_activityFilter, 0);
+        g_activityList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT |
+            LVS_SHOWSELALWAYS, 0, 0, 0, 0, hwnd, (HMENU)IDA_LIST, g_hInstance, nullptr);
+        ListView_SetExtendedListViewStyle(g_activityList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        g_activityPrimary = CreateWindowW(L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_PRIMARY, g_hInstance, nullptr);
+        g_activitySecondary = CreateWindowW(L"BUTTON", L"More", WS_CHILD,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_SECONDARY, g_hInstance, nullptr);
+        g_activityDelete = CreateWindowW(L"BUTTON", L"Delete selected", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_DELETE, g_hInstance, nullptr);
+        g_activityClear = CreateWindowW(L"BUTTON", L"Clear history", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)IDA_CLEAR, g_hInstance, nullptr);
+        RefreshActivityWindow();
+        return 0;
+    case WM_SIZE:
+        LayoutActivityWindow(hwnd);
+        return 0;
+    case WM_GETMINMAXINFO: {
+        auto *limits = reinterpret_cast<MINMAXINFO *>(lp);
+        limits->ptMinTrackSize.x = 860;
+        limits->ptMinTrackSize.y = 520;
+        return 0;
+    }
+    case WM_APP_ACTIVITY_REFRESH:
+        RefreshActivityWindow();
+        return 0;
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        if (id == IDA_HISTORY_TAB || id == IDA_DOWNLOADS_TAB) {
+            g_activityDownloadsMode = id == IDA_DOWNLOADS_TAB;
+            RefreshActivityWindow();
+        } else if (id == IDA_SEARCH && HIWORD(wp) == EN_CHANGE) {
+            RefreshActivityWindow();
+        } else if (id == IDA_FILTER && HIWORD(wp) == CBN_SELCHANGE) {
+            RefreshActivityWindow();
+        } else if (id == IDA_PRIMARY) {
+            auto ids = SelectedActivityIds();
+            if (ids.size() == 1) {
+                if (!g_activityDownloadsMode) {
+                    auto found = std::find_if(g_activityStore.History().begin(), g_activityStore.History().end(),
+                        [&](const auto &entry) { return entry.id == ids[0]; });
+                    if (found != g_activityStore.History().end() && ActivityStore::IsWebUrl(found->url)) {
+                        CreateTab(found->url);
+                    }
+                } else {
+                    DownloadEntry *entry = g_activityStore.FindDownload(ids[0]);
+                    if (entry && ActivityStore::IsActiveDownloadState(entry->state)) PerformDownloadAction(ids[0], DownloadAction::PauseResume);
+                    else if (entry && entry->state == L"completed") PerformDownloadAction(ids[0], DownloadAction::Open);
+                    else PerformDownloadAction(ids[0], DownloadAction::Retry);
+                }
+            }
+        } else if (id == IDA_SECONDARY) {
+            auto ids = SelectedActivityIds();
+            if (ids.size() == 1) {
+                DownloadEntry *entry = g_activityStore.FindDownload(ids[0]);
+                if (entry && ActivityStore::IsActiveDownloadState(entry->state)) PerformDownloadAction(ids[0], DownloadAction::Cancel);
+                else PerformDownloadAction(ids[0], DownloadAction::Folder);
+            }
+        } else if (id == IDA_DELETE) {
+            auto ids = SelectedActivityIds();
+            if (ids.empty()) return 0;
+            if (g_activityDownloadsMode) g_activityStore.RemoveDownloads(ids, true);
+            else if (MessageBoxW(hwnd, L"Delete the selected history records?", L"History", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                g_activityStore.RemoveHistory(ids);
+            RefreshActivityWindow();
+        } else if (id == IDA_CLEAR) {
+            if (g_activityDownloadsMode) {
+                if (MessageBoxW(hwnd, L"Clear all finished download records? Downloaded files will be kept.",
+                                L"Downloads", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    g_activityStore.ClearTerminalDownloads();
+            } else if (MessageBoxW(hwnd, L"Clear all browsing history?", L"History",
+                                   MB_YESNO | MB_ICONWARNING) == IDYES) {
+                g_activityStore.ClearHistory();
+            }
+            RefreshActivityWindow();
+        }
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto *header = reinterpret_cast<NMHDR *>(lp);
+        if (header->idFrom == IDA_LIST && header->code == LVN_ITEMCHANGED) {
+            UpdateDownloadButtons();
+        } else if (header->idFrom == IDA_LIST && header->code == NM_DBLCLK) {
+            PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDA_PRIMARY, BN_CLICKED), 0);
+        }
+        return 0;
+    }
+    case WM_CONTEXTMENU:
+        if ((HWND)wp == g_activityList && g_activityDownloadsMode) {
+            auto ids = SelectedActivityIds();
+            if (ids.size() == 1) {
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 1, L"Open file");
+                AppendMenuW(menu, MF_STRING, 2, L"Open folder");
+                AppendMenuW(menu, MF_STRING, 3, L"Pause / Resume");
+                AppendMenuW(menu, MF_STRING, 4, L"Cancel");
+                AppendMenuW(menu, MF_STRING, 5, L"Retry");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 6, L"Delete record");
+                AppendMenuW(menu, MF_STRING, 7, L"Delete file and record...");
+                POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                             point.x, point.y, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+                const DownloadAction actions[] = {DownloadAction::Open, DownloadAction::Folder,
+                    DownloadAction::PauseResume, DownloadAction::Cancel, DownloadAction::Retry,
+                    DownloadAction::DeleteRecord, DownloadAction::DeleteFile};
+                if (command >= 1 && command <= 7) PerformDownloadAction(ids[0], actions[command - 1]);
+            }
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    case WM_DESTROY: {
+        g_activityWnd = nullptr;
+        return 0;
+    }
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+static void OpenActivityWindow(bool downloads, const std::wstring &highlightId) {
+    g_activityDownloadsMode = downloads;
+    if (!g_activityWnd) {
+        g_activityWnd = CreateWindowExW(WS_EX_APPWINDOW, L"ActivityCenterWnd",
+            L"Activity Center - WebView Browser", WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT, 1000, 720, g_mainWnd, nullptr,
+            g_hInstance, nullptr);
+    }
+    RefreshActivityWindow();
+    ShowWindow(g_activityWnd, SW_SHOW);
+    if (IsIconic(g_activityWnd)) ShowWindow(g_activityWnd, SW_RESTORE);
+    SetForegroundWindow(g_activityWnd);
+    if (!highlightId.empty()) {
+        auto found = std::find(g_activityVisibleIds.begin(), g_activityVisibleIds.end(), highlightId);
+        if (found != g_activityVisibleIds.end()) {
+            int row = static_cast<int>(found - g_activityVisibleIds.begin());
+            ListView_SetItemState(g_activityList, row, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(g_activityList, row, FALSE);
+        }
+    }
+}
+
 static int MeasureTabWidth(std::wstring_view text) {
     HDC dc = GetDC(g_mainWnd);
     HFONT oldFont = (HFONT)SelectObject(dc, g_boldFont);
@@ -524,6 +1285,20 @@ static void PaintToolbar(HDC dc) {
                   press ? kGoPress : (hover ? kGoHover : kGoColor));
     DrawTextCentered(mem, g_goRc, L"Go", g_boldFont, RGB(255, 255, 255));
 
+    auto drawActivityButton = [&](const RECT &button, HitKind kind,
+                                  const std::wstring &label) {
+        const bool buttonHover = g_hoverKind == kind;
+        const bool buttonPress = g_pressKind == kind;
+        FillRoundRect(mem, button, r * 2,
+                      buttonPress ? kPressTab : (buttonHover ? kHoverTab : kBoxBg));
+        DrawTextCentered(mem, button, label, g_font, kTextActive);
+    };
+    drawActivityButton(g_historyRc, HIT_HISTORY, L"History");
+    std::wstring downloadsLabel = L"Downloads";
+    const auto activeDownloads = g_activityStore.ActiveDownloadCount();
+    if (activeDownloads) downloadsLabel += L" (" + std::to_wstring(activeDownloads) + L")";
+    drawActivityButton(g_downloadsRc, HIT_DOWNLOADS, downloadsLabel);
+
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
 }
 
@@ -647,23 +1422,28 @@ static LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSEMOVE: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        bool over = PtInRect(&g_goRc, pt);
-        if ((g_hoverKind == HIT_GO) != over) {
-            g_hoverKind = over ? HIT_GO : HIT_NONE;
+        HitKind over = PtInRect(&g_goRc, pt) ? HIT_GO
+            : PtInRect(&g_historyRc, pt) ? HIT_HISTORY
+            : PtInRect(&g_downloadsRc, pt) ? HIT_DOWNLOADS : HIT_NONE;
+        if (g_hoverKind != over) {
+            g_hoverKind = over;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         TrackMouseLeave(hwnd);
         return 0;
     }
     case WM_MOUSELEAVE:
-        if (g_hoverKind == HIT_GO) {
+        if (g_hoverKind == HIT_GO || g_hoverKind == HIT_HISTORY ||
+            g_hoverKind == HIT_DOWNLOADS) {
             g_hoverKind = HIT_NONE;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     case WM_LBUTTONDOWN: {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        g_pressKind = PtInRect(&g_goRc, pt) ? HIT_GO : HIT_NONE;
+        g_pressKind = PtInRect(&g_goRc, pt) ? HIT_GO
+            : PtInRect(&g_historyRc, pt) ? HIT_HISTORY
+            : PtInRect(&g_downloadsRc, pt) ? HIT_DOWNLOADS : HIT_NONE;
         SetCapture(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -672,6 +1452,10 @@ static LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (g_pressKind == HIT_GO && PtInRect(&g_goRc, pt)) {
             PostMessageW(g_mainWnd, WM_COMMAND, MAKEWPARAM(ID_GO, 0), 0);
+        } else if (g_pressKind == HIT_HISTORY && PtInRect(&g_historyRc, pt)) {
+            PostMessageW(g_mainWnd, WM_COMMAND, MAKEWPARAM(ID_OPEN_HISTORY, 0), 0);
+        } else if (g_pressKind == HIT_DOWNLOADS && PtInRect(&g_downloadsRc, pt)) {
+            PostMessageW(g_mainWnd, WM_COMMAND, MAKEWPARAM(ID_OPEN_DOWNLOADS, 0), 0);
         }
         g_pressKind = HIT_NONE;
         ReleaseCapture();
@@ -713,10 +1497,17 @@ static void LayoutControls() {
     int padX = (int)(10 * g_scale);
     int padY = (int)(7 * g_scale);
     int goW = (int)(58 * g_scale);
-    g_boxRc = {padX, padY, trc.right - padX - goW - (int)(8 * g_scale),
+    int historyW = (int)(76 * g_scale);
+    int downloadsW = (int)(112 * g_scale);
+    int gap = (int)(8 * g_scale);
+    int right = trc.right - padX;
+    g_downloadsRc = {right - downloadsW, padY, right, trc.bottom - padY};
+    right = g_downloadsRc.left - gap;
+    g_historyRc = {right - historyW, padY, right, trc.bottom - padY};
+    right = g_historyRc.left - gap;
+    g_goRc = {right - goW, padY, right, trc.bottom - padY};
+    g_boxRc = {padX, padY, g_goRc.left - gap,
                trc.bottom - padY};
-    g_goRc = {g_boxRc.right + (int)(8 * g_scale), padY, trc.right - padX,
-              trc.bottom - padY};
 
     int ePad = (int)(12 * g_scale);
     MoveWindow(g_addressEdit, g_boxRc.left + ePad,
@@ -813,6 +1604,18 @@ static void CreateTab(const std::wstring &url) {
             core->add_SourceChanged(sc, &g_tabs[idx].sourceToken);
             sc->Release();
 
+            auto *navigation = new NavigationCompletedHandler(tab.w, core);
+            core->add_NavigationCompleted(navigation, &g_tabs[idx].navigationToken);
+            navigation->Release();
+
+            ICoreWebView2_4 *core4 = nullptr;
+            if (SUCCEEDED(core->QueryInterface(IID_PPV_ARGS(&core4))) && core4) {
+                auto *download = new DownloadStartingHandler();
+                core4->add_DownloadStarting(download, &g_tabs[idx].downloadToken);
+                download->Release();
+                core4->Release();
+            }
+
             core->Release();
         }
     }
@@ -883,6 +1686,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_addressEdit, GWLP_WNDPROC, (LONG_PTR)AddressEditProc);
 
         HMENU hMenuBar = CreateMenu();
+        HMENU hActivity = CreatePopupMenu();
+        AppendMenuW(hActivity, MF_STRING, IDM_HISTORY, L"History\tCtrl+H");
+        AppendMenuW(hActivity, MF_STRING, IDM_DOWNLOADS, L"Downloads\tCtrl+J");
+        AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hActivity, L"Activity");
         HMENU hHelp = CreatePopupMenu();
         AppendMenuW(hHelp, MF_STRING, IDM_ABOUT, L"About...");
         AppendMenuW(hMenuBar, MF_POPUP, (UINT_PTR)hHelp, L"Help");
@@ -942,8 +1749,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetFocus(g_addressEdit);
             SendMessageW(g_addressEdit, EM_SETSEL, 0, -1);
         }
+        else if (id == ID_OPEN_HISTORY || id == IDM_HISTORY) {
+            OpenActivityWindow(false);
+        }
+        else if (id == ID_OPEN_DOWNLOADS || id == IDM_DOWNLOADS) {
+            OpenActivityWindow(true);
+        }
         else if (id == IDM_ABOUT) {
-            MessageBoxW(hwnd, L"WebView Browser\nVersion 1.2.0", L"About",
+            MessageBoxW(hwnd, L"WebView Browser\nVersion " APP_VERSION, L"About",
                 MB_OK | MB_ICONINFORMATION);
         }
         break;
@@ -954,14 +1767,73 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         delete u;
         break;
     }
+    case WM_APP_TOAST_ACTIVATED: {
+        std::unique_ptr<std::wstring> arguments(reinterpret_cast<std::wstring *>(lp));
+        if (!arguments) return 0;
+        const std::wstring prefix = L"download:";
+        const std::size_t separator = arguments->rfind(L':');
+        if (arguments->rfind(prefix, 0) == 0 && separator != std::wstring::npos &&
+            separator > prefix.size()) {
+            const std::wstring id = arguments->substr(prefix.size(), separator - prefix.size());
+            const std::wstring action = arguments->substr(separator + 1);
+            DownloadEntry *entry = g_activityStore.FindDownload(id);
+            ShowWindow(hwnd, SW_SHOW);
+            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            if (entry && action == L"open" && FileExists(entry->savePath)) {
+                ShellExecuteW(hwnd, L"open", entry->savePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            } else if (entry && action == L"retry") {
+                g_pendingRetries[entry->url].push_back(entry->id);
+                CreateTab(entry->url);
+            } else {
+                OpenActivityWindow(true, entry ? id : L"");
+            }
+        }
+        return 0;
+    }
     case WM_CLOSE:
+        if (!g_allowClose && g_activityStore.ActiveDownloadCount() > 0) {
+            const std::wstring message = std::to_wstring(g_activityStore.ActiveDownloadCount()) +
+                L" download(s) are still in progress.\n\nExit and interrupt them?";
+            if (MessageBoxW(hwnd, message.c_str(), L"Downloads in progress",
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                return 0;
+            }
+            g_allowClose = true;
+            for (auto &[id, runtime] : g_downloadRuntime) {
+                DownloadEntry *entry = g_activityStore.FindDownload(id);
+                if (entry && ActivityStore::IsActiveDownloadState(entry->state) &&
+                    runtime->operation) {
+                    runtime->operation->Cancel();
+                }
+            }
+        }
         while (!g_tabs.empty()) {
             webview_destroy(g_tabs[0].w);
             g_tabs.erase(g_tabs.begin());
         }
         DestroyWindow(hwnd);
         break;
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        if (g_activityWnd) {
+            DestroyWindow(g_activityWnd);
+            g_activityWnd = nullptr;
+        }
+        for (auto &[id, runtime] : g_downloadRuntime) {
+            if (runtime->operation) {
+                runtime->operation->remove_BytesReceivedChanged(runtime->bytesToken);
+                runtime->operation->remove_StateChanged(runtime->stateToken);
+                runtime->operation->Release();
+                runtime->operation = nullptr;
+            }
+        }
+        g_downloadRuntime.clear();
+        ShutdownNativeNotifications();
+        NOTIFYICONDATAW notification{};
+        notification.cbSize = sizeof(notification);
+        notification.hWnd = hwnd;
+        notification.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &notification);
         g_tabPaintBuffer.Reset();
         g_toolbarPaintBuffer.Reset();
         DeleteObject(g_boxBrush);
@@ -969,6 +1841,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DeleteObject(g_boldFont);
         PostQuitMessage(0);
         break;
+    }
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -977,8 +1850,15 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    RoInitialize(RO_INIT_SINGLETHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_hInstance = hInstance;
+    g_activityStore.Load();
+
+    INITCOMMONCONTROLSEX commonControls{};
+    commonControls.dwSize = sizeof(commonControls);
+    commonControls.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&commonControls);
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -1012,13 +1892,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     tc.lpszClassName = L"ToolbarWnd";
     RegisterClassExW(&tc);
 
+    WNDCLASSEXW ac{};
+    ac.cbSize = sizeof(ac);
+    ac.lpfnWndProc = ActivityWndProc;
+    ac.hInstance = hInstance;
+    ac.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    ac.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    ac.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    ac.lpszClassName = L"ActivityCenterWnd";
+    RegisterClassExW(&ac);
+
     g_mainWnd = CreateWindowExW(
         0, L"BrowserMain", APP_NAME, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
         CW_USEDEFAULT, 1280, 800, nullptr, nullptr, hInstance, nullptr);
     if (!g_mainWnd) {
+        RoUninitialize();
         CoUninitialize();
         return 1;
     }
+    InitializeNativeNotifications(g_mainWnd, WM_APP_TOAST_ACTIVATED);
 
     ACCEL accels[] = {
         {FVIRTKEY | FCONTROL,          'T',    ID_PLUS},
@@ -1026,6 +1918,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         {FVIRTKEY | FCONTROL,          VK_TAB, ID_NEXT_TAB},
         {FVIRTKEY | FCONTROL | FSHIFT, VK_TAB, ID_PREV_TAB},
         {FVIRTKEY | FCONTROL,          'L',    ID_FOCUS_ADDRESS},
+        {FVIRTKEY | FCONTROL,          'H',    ID_OPEN_HISTORY},
+        {FVIRTKEY | FCONTROL,          'J',    ID_OPEN_DOWNLOADS},
     };
     g_hAccel = CreateAcceleratorTableW(accels, ARRAYSIZE(accels));
 
@@ -1047,6 +1941,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_hAccel = nullptr;
     }
 
+    RoUninitialize();
     CoUninitialize();
     return (int)msg.wParam;
 

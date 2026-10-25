@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Activity Center</title>
+    <link rel="stylesheet" href="activity.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <h1>Activity Center</h1>
+      <button class="nav-button active" data-section="history" type="button">History</button>
+      <button class="nav-button" data-section="downloads" type="button">
+        Downloads <span id="active-count" class="badge" hidden></span>
+      </button>
+    </aside>
+    <main>
+      <section id="history-section" class="section active" aria-labelledby="history-heading">
+        <header class="section-header">
+          <div>
+            <h2 id="history-heading">History</h2>
+            <p>Pages visited in the last 90 days</p>
+          </div>
+          <div class="header-actions">
+            <button id="delete-history-selection" class="secondary" type="button" disabled>Delete selected</button>
+            <button id="clear-history" class="danger" type="button">Clear history</button>
+          </div>
+        </header>
+        <label class="search"><span>Search</span><input id="history-search" type="search" placeholder="Search title or URL" /></label>
+        <div id="history-list" class="list"></div>
+      </section>
+
+      <section id="downloads-section" class="section" aria-labelledby="downloads-heading">
+        <header class="section-header">
+          <div>
+            <h2 id="downloads-heading">Downloads</h2>
+            <p>Downloads from the last year</p>
+          </div>
+          <div class="header-actions">
+            <button id="delete-download-selection" class="secondary" type="button" disabled>Delete selected records</button>
+            <button id="clear-downloads" class="danger" type="button">Clear finished</button>
+          </div>
+        </header>
+        <div class="filters">
+          <label class="search"><span>Search</span><input id="downloads-search" type="search" placeholder="Search file or source URL" /></label>
+          <label class="filter"><span>Status</span>
+            <select id="download-filter">
+              <option value="all">All</option>
+              <option value="active">In progress</option>
+              <option value="completed">Completed</option>
+              <option value="failed">Failed</option>
+            </select>
+          </label>
+        </div>
+        <div id="downloads-list" class="list"></div>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="activity.js"></script>
+  </body>
+</html>

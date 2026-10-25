@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebView Browser</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="browser-chrome">
+      <div id="tab-strip" class="tab-strip" role="tablist" aria-label="浏览器标签页">
+        <div id="tabs" class="tabs"></div>
+        <button id="new-tab" class="new-tab" type="button" title="新建标签页 (Ctrl+T)" aria-label="新建标签页">+</button>
+      </div>
+      <form id="address-form" class="toolbar">
+        <label class="address-box" aria-label="地址栏">
+          <input id="address" type="text" autocomplete="off" spellcheck="false" aria-label="网址或搜索内容" />
+        </label>
+        <button class="go-button" type="submit">Go</button>
+        <button id="history-button" class="activity-button" type="button" title="History (Ctrl+H)" aria-label="Open history">History</button>
+        <button id="downloads-button" class="activity-button" type="button" title="Downloads (Ctrl+J)" aria-label="Open downloads">
+          Downloads <span id="download-count" class="download-count" hidden></span>
+        </button>
+      </form>
+    </header>
+    <script src="renderer.js"></script>
+  </body>
+</html>
