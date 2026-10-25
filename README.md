@@ -2,7 +2,7 @@
 
 一个用 C++ 手写的 Windows 多标签浏览器：界面用 **Win32 原生 API 自绘**（标签栏、地址栏、工具栏），网页渲染交给 **WebView2**（Microsoft Edge 内核）。
 
-- 版本：**1.3.0**
+- 版本：**1.3.1**
 - 平台：Windows 10 / 11 x64
 - 许可证：**AGPL-3.0**（见 LICENSE.txt）
 
@@ -47,7 +47,7 @@ Release 构建：
 
     powershell -ExecutionPolicy Bypass -File installer\build-native-installer.ps1
 
-安装产物为 `dist\WebView-Browser-Setup-1.3.0.exe`；单文件便携版可直接使用 `dist\WebView-Browser-1.3.0-portable.exe`。安装器始终创建开始菜单快捷方式，桌面快捷方式默认不勾选；覆盖升级会保留活动记录。卸载时可选删除历史与下载记录，默认保留，并且从不删除已下载文件。
+安装产物为 `dist\WebView-Browser-Setup-1.3.1.exe`；单文件便携版可直接使用 `dist\WebView-Browser-1.3.1-portable.exe`。安装器始终创建开始菜单快捷方式，桌面快捷方式默认不勾选；覆盖升级会保留活动记录。卸载时可选删除历史与下载记录，默认保留，并且从不删除已下载文件。
 
 如果使用其它版本的 Visual Studio，可手动指定生成器：
 
@@ -105,6 +105,18 @@ Release 构建：
 - 活动记录保存在 `%LOCALAPPDATA%\WebView Browser\activity.dat`；损坏数据会先保留副本再安全重建
 - 退出时若仍有活动下载会先提示；确认退出后，下次启动会把未完成记录标记为 interrupted，供用户手动重试
 - 安装包未进行代码签名，Windows 可能显示发布者未知提示
+- 网页请求的剪贴板读取、摄像头、麦克风及定位权限默认拒绝；键盘主动粘贴不依赖这项网页权限。网页弹窗仅允许 HTTP/HTTPS 地址，地址栏仍可手动打开本地文件。
+- 新标签首次加载网页前会检查并撤销旧版保存的允许权限，不清除 Cookie、密码、站点存储或历史。若权限检查或撤销失败则不会加载网页，请更新 WebView2 运行时。
+- 下载文件操作仅针对当前用户可访问的本地普通文件，不处理目录、链接或 UNC 网络路径。
+
+## 安全审查与回归验证
+
+v1.3.1 修复剪贴板自动授权、Electron 子框架地址栏覆盖、网页弹窗协议检查及原版下载回调重入问题，并强化内部界面 IPC、内容安全策略和文件删除确认。详细范围与证据见 [安全审查报告](security_best_practices_report.md)。
+
+    cmake --build --preset debug --parallel
+    ctest --test-dir build/debug -C Debug --output-on-failure
+
+测试使用独立临时数据和 COM 测试对象，不读取真实剪贴板或删除用户下载文件。
 
 ## TODO
 

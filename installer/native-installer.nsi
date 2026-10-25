@@ -7,7 +7,7 @@ SetCompressor /SOLID lzma
 !include "LogicLib.nsh"
 
 !define APP_NAME "WebView Browser"
-!define APP_VERSION "1.3.0"
+!define APP_VERSION "1.3.1"
 !define APP_ID "OpenCode.WebViewBrowser"
 !define APP_EXE "webview_example.exe"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\WebViewBrowser"

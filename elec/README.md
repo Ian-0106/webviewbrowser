@@ -39,8 +39,8 @@ npm run build:win
 构建完成后，可直接双击运行：
 
 ```text
-dist/WebView-Browser-Electron-Setup-1.3.0.exe
-dist/WebView-Browser-Electron-1.3.0-portable.exe
+dist/WebView-Browser-Electron-Setup-1.3.1.exe
+dist/WebView-Browser-Electron-1.3.1-portable.exe
 ```
 
 安装版按当前用户安装，不需要管理员权限；开始菜单快捷方式必建，桌面快捷方式默认不勾选。覆盖升级保留活动记录。卸载时可选删除历史与下载记录（默认不删除），且不会删除已下载文件。
@@ -61,5 +61,21 @@ elec/
 ```
 
 安装版与便携版均未进行代码签名，Windows 可能显示发布者未知提示。
+
+## v1.3.1 安全修复
+
+- 所有内部消息校验发送窗口、主框架和完整本地页面地址；浏览器工具栏与活动中心使用独立的最小权限通信桥。
+- 子框架跳转不再改写主地址栏；网页弹窗只允许 HTTP/HTTPS，手动打开本地文件仍可用。
+- 内部界面启用严格内容安全策略，拦截导航、重定向及子框架导航。
+- 删除下载文件由主进程弹出确认；文件操作拒绝目录、链接、NUL、相对路径和 UNC 网络路径。
+- 损坏的活动记录会校验结构、保留证据并恢复。
+
+运行真实 Electron 进程中的安全集成测试：
+
+```powershell
+node node_modules/electron/cli.js verification/security-smoke.cjs
+```
+
+测试使用临时资料目录和本地 HTTP 页面；回收站操作被测试替身拦截，不会删除真实下载。详细审查结论见根目录 `security_best_practices_report.md`。
 
 项目继续遵循仓库根目录的 AGPL-3.0 许可证。

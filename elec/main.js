@@ -15,6 +15,7 @@ const {
 } = require('electron');
 const { normalizeUrl } = require('./src/url');
 const { ActivityStore, ACTIVE_DOWNLOAD_STATES, isWebUrl } = require('./src/activity-store');
+const { isTrustedSender, isLocalAbsolutePath, isRegularDownloadFile } = require('./src/security');
 
 const APP_NAME = 'WebView Browser Electron';
 const APP_ID = 'com.webviewbrowser.electron';
@@ -60,7 +61,7 @@ function sendTabState() {
 function getActivityState() {
   const downloads = activityStore.listDownloads().map((entry) => ({
     ...entry,
-    exists: Boolean(entry.savePath && fs.existsSync(entry.savePath)),
+    exists: isRegularDownloadFile(entry.savePath),
   }));
   return {
     history: activityStore.listHistory(),
@@ -206,14 +207,15 @@ function createTab(targetUrl = NEW_TAB_URL) {
   };
   view.webContents.on('did-navigate', syncUrl);
   view.webContents.on('did-navigate-in-page', (event, currentUrl, isMainFrame) => {
-    syncUrl(event, currentUrl);
     if (isMainFrame) {
+      syncUrl(event, currentUrl);
       recordTabHistory(tab);
     }
   });
   view.webContents.on('did-finish-load', () => recordTabHistory(tab));
   view.webContents.setWindowOpenHandler(({ url: popupUrl }) => {
-    createTab(popupUrl || NEW_TAB_URL);
+    // A website popup must not become a host-initiated local-file navigation.
+    if (isWebUrl(popupUrl)) createTab(popupUrl);
     return { action: 'deny' };
   });
   view.webContents.on('destroyed', () => {
@@ -292,7 +294,7 @@ async function openActivity(section = 'history', highlightId = null) {
       title: `Activity Center - ${APP_NAME}`,
       backgroundColor: '#f7f8fa',
       webPreferences: {
-        preload: path.join(__dirname, 'preload.js'),
+        preload: path.join(__dirname, 'activity-preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
@@ -300,10 +302,18 @@ async function openActivity(section = 'history', highlightId = null) {
     });
     activityWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     activityWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+    activityWindow.webContents.on('will-frame-navigate', (event) => event.preventDefault());
+    activityWindow.webContents.on('will-redirect', (event) => event.preventDefault());
+    attachShortcutHandler(activityWindow.webContents);
     activityWindow.on('closed', () => {
       activityWindow = null;
     });
     await activityWindow.loadFile(path.join(__dirname, 'renderer', 'activity.html'));
+  }
+  if (!activityWindow || activityWindow.isDestroyed()) return;
+  if (activityWindow.webContents.isLoadingMainFrame()) {
+    await new Promise((resolve) => activityWindow.webContents.once('did-finish-load', resolve));
+    if (!activityWindow || activityWindow.isDestroyed()) return;
   }
   activityWindow.webContents.send('activity:navigate', { section, highlightId });
   activityWindow.webContents.send('activity:state', getActivityState());
@@ -420,7 +430,7 @@ function showDownloadNotification(record) {
 
 function retryDownload(id) {
   const record = activityStore.getDownload(id);
-  if (!record?.url) {
+  if (!record || !isWebUrl(record.url) || ACTIVE_DOWNLOAD_STATES.has(record.state)) {
     return false;
   }
   enqueueRetry(record.url, id);
@@ -435,7 +445,7 @@ async function activateDownloadNotification(argumentsValue) {
   }
   const [, id, action] = match;
   const record = activityStore?.getDownload(id);
-  if (action === 'open' && record?.savePath && fs.existsSync(record.savePath)) {
+  if (action === 'open' && record?.state === 'completed' && isRegularDownloadFile(record.savePath)) {
     await shell.openPath(record.savePath);
     return;
   }
@@ -448,31 +458,49 @@ async function activateDownloadNotification(argumentsValue) {
 }
 
 function installIpcHandlers() {
-  ipcMain.handle('tabs:get-state', () => getTabState());
-  ipcMain.on('tabs:create', () => createTab(NEW_TAB_URL));
-  ipcMain.on('tabs:activate', (_event, id) => activateTab(Number(id)));
-  ipcMain.on('tabs:close', (_event, id) => closeTab(Number(id)));
-  ipcMain.on('tabs:navigate', (_event, value) => navigateActiveTab(value));
-  ipcMain.on('activity:open', (_event, section) => openActivity(section));
-  ipcMain.handle('activity:get-state', () => getActivityState());
-  ipcMain.on('history:open', (_event, url) => {
+  const trusted = (event, role) => isTrustedSender(event,
+    role === 'chrome' ? mainWindow : activityWindow,
+    path.join(__dirname, 'renderer', role === 'chrome' ? 'index.html' : 'activity.html'));
+  const on = (channel, role, handler) => ipcMain.on(channel, (event, ...args) => {
+    if (trusted(event, role)) handler(event, ...args);
+  });
+  const handle = (channel, role, handler) => ipcMain.handle(channel, (event, ...args) => {
+    if (!trusted(event, role)) throw new Error('This window is not authorized for that operation.');
+    return handler(event, ...args);
+  });
+  handle('tabs:get-state', 'chrome', () => getTabState());
+  on('tabs:create', 'chrome', () => createTab(NEW_TAB_URL));
+  on('tabs:activate', 'chrome', (_event, id) => {
+    if (Number.isSafeInteger(id)) activateTab(id);
+  });
+  on('tabs:close', 'chrome', (_event, id) => {
+    if (Number.isSafeInteger(id)) closeTab(id);
+  });
+  on('tabs:navigate', 'chrome', (_event, value) => {
+    if (typeof value === 'string' && value.length <= 32768) navigateActiveTab(value);
+  });
+  on('activity:open', 'chrome', (_event, section) => {
+    if (section === 'history' || section === 'downloads') openActivity(section);
+  });
+  handle('activity:get-state', 'activity', () => getActivityState());
+  on('history:open', 'activity', (_event, url) => {
     if (!isWebUrl(url)) {
       return;
     }
     focusMainWindow();
     createTab(url);
   });
-  ipcMain.handle('history:remove', (_event, ids) => {
+  handle('history:remove', 'activity', (_event, ids) => {
     const removed = activityStore.removeHistory(Array.isArray(ids) ? ids : []);
     broadcastActivityState();
     return removed;
   });
-  ipcMain.handle('history:clear', () => {
+  handle('history:clear', 'activity', () => {
     const removed = activityStore.clearHistory();
     broadcastActivityState();
     return removed;
   });
-  ipcMain.handle('downloads:action', async (_event, id, action) => {
+  handle('downloads:action', 'activity', async (_event, id, action) => {
     const record = activityStore.getDownload(id);
     const item = activeDownloads.get(id);
     if (!record) {
@@ -487,16 +515,16 @@ function installIpcHandlers() {
     } else if (action === 'retry') {
       return { ok: retryDownload(id) };
     } else if (action === 'open-file') {
-      if (!record.savePath || !fs.existsSync(record.savePath)) {
+      if (record.state !== 'completed' || !isRegularDownloadFile(record.savePath)) {
         return { ok: false, message: 'The downloaded file no longer exists.' };
       }
       const error = await shell.openPath(record.savePath);
       return { ok: !error, message: error };
     } else if (action === 'open-folder') {
-      if (!record.savePath) {
+      if (!isLocalAbsolutePath(record.savePath)) {
         return { ok: false, message: 'No saved file path is available.' };
       }
-      if (fs.existsSync(record.savePath)) {
+      if (isRegularDownloadFile(record.savePath)) {
         shell.showItemInFolder(record.savePath);
       } else {
         const error = await shell.openPath(path.dirname(record.savePath));
@@ -507,17 +535,17 @@ function installIpcHandlers() {
     }
     return { ok: true };
   });
-  ipcMain.handle('downloads:remove', (_event, ids) => {
+  handle('downloads:remove', 'activity', (_event, ids) => {
     const removed = activityStore.removeDownloads(Array.isArray(ids) ? ids : [], { terminalOnly: true });
     broadcastActivityState();
     return removed;
   });
-  ipcMain.handle('downloads:clear', () => {
+  handle('downloads:clear', 'activity', () => {
     const removed = activityStore.clearTerminalDownloads();
     broadcastActivityState();
     return removed;
   });
-  ipcMain.handle('downloads:trash', async (_event, id) => {
+  handle('downloads:trash', 'activity', async (_event, id) => {
     const record = activityStore.getDownload(id);
     if (!record) {
       return { ok: false, message: 'The download record no longer exists.' };
@@ -525,10 +553,23 @@ function installIpcHandlers() {
     if (ACTIVE_DOWNLOAD_STATES.has(record.state)) {
       return { ok: false, message: 'Cancel the active download before deleting it.' };
     }
-    if (!record.savePath || !fs.existsSync(record.savePath)) {
+    if (!isRegularDownloadFile(record.savePath)) {
       return { ok: false, message: 'The downloaded file no longer exists.' };
     }
-    await shell.trashItem(record.savePath);
+    const originalPath = record.savePath;
+    const choice = await dialog.showMessageBox(activityWindow, {
+      type: 'warning', title: 'Delete downloaded file',
+      message: `Move “${record.filename}” to the Recycle Bin and remove its record?`,
+      buttons: ['Cancel', 'Move to Recycle Bin'], defaultId: 0, cancelId: 0,
+    });
+    if (choice.response !== 1) return { ok: true };
+    // The record and file can change while the native confirmation is open.
+    const current = activityStore.getDownload(id);
+    if (!current || current.savePath !== originalPath || ACTIVE_DOWNLOAD_STATES.has(current.state)
+      || !isRegularDownloadFile(originalPath)) {
+      return { ok: false, message: 'The download changed. Please select it again.' };
+    }
+    await shell.trashItem(originalPath);
     activityStore.removeDownloads([id]);
     broadcastActivityState();
     return { ok: true };
@@ -600,6 +641,8 @@ async function createWindow() {
   attachShortcutHandler(mainWindow.webContents);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+  mainWindow.webContents.on('will-frame-navigate', (event) => event.preventDefault());
+  mainWindow.webContents.on('will-redirect', (event) => event.preventDefault());
   mainWindow.on('resize', layoutActiveTab);
   mainWindow.on('close', confirmMainWindowClose);
   mainWindow.on('closed', () => {

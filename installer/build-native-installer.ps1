@@ -19,6 +19,7 @@ if (-not $makeNsis) {
 if (-not $makeNsis) { throw 'makensis.exe was not found. Install NSIS or build the Electron installer once.' }
 
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $outputDir 'WebView-Browser-1.3.1-portable.exe') -Force
 Push-Location $PSScriptRoot
 try {
   & $makeNsis 'native-installer.nsi'

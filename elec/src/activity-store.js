@@ -9,6 +9,25 @@ const DOWNLOAD_MAX_AGE_MS = 365 * 24 * 60 * 60 * 1000;
 const HISTORY_MAX_ITEMS = 10_000;
 const DOWNLOAD_MAX_ITEMS = 5_000;
 const ACTIVE_DOWNLOAD_STATES = new Set(['waiting', 'progressing', 'paused']);
+const DOWNLOAD_STATES = new Set([...ACTIVE_DOWNLOAD_STATES, 'completed', 'cancelled', 'failed', 'interrupted']);
+
+function isText(value, max = 32768) {
+  return typeof value === 'string' && value.length <= max && !value.includes('\0');
+}
+
+function validHistory(entry) {
+  return entry && isText(entry.id, 128) && entry.id.length > 0 && isText(entry.title, 65536)
+    && isText(entry.url) && isWebUrl(entry.url) && Number.isFinite(Date.parse(entry.visitedAt));
+}
+
+function validDownload(entry) {
+  return entry && isText(entry.id, 128) && entry.id.length > 0 && isText(entry.filename, 4096)
+    && isText(entry.url) && isText(entry.savePath) && DOWNLOAD_STATES.has(entry.state)
+    && Number.isSafeInteger(entry.receivedBytes) && entry.receivedBytes >= 0
+    && Number.isSafeInteger(entry.totalBytes) && entry.totalBytes >= -1
+    && Number.isFinite(Date.parse(entry.startedAt))
+    && (entry.finishedAt == null || Number.isFinite(Date.parse(entry.finishedAt)));
+}
 
 function defaultData() {
   return { version: 1, history: [], downloads: [] };
@@ -37,13 +56,21 @@ class ActivityStore {
   }
 
   load() {
+    let malformed = false;
     try {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+      if (!parsed || !Array.isArray(parsed.history) || !Array.isArray(parsed.downloads)) {
+        throw new Error('Invalid activity storage schema');
+      }
       this.data = {
         version: 1,
-        history: Array.isArray(parsed.history) ? parsed.history : [],
-        downloads: Array.isArray(parsed.downloads) ? parsed.downloads : [],
+        history: parsed.history.filter(validHistory),
+        downloads: parsed.downloads.filter(validDownload),
       };
+      malformed = this.data.history.length !== parsed.history.length || this.data.downloads.length !== parsed.downloads.length;
+      if (malformed) {
+        fs.copyFileSync(this.filePath, `${this.filePath}.corrupt-${Date.now()}`);
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') {
         try {
@@ -55,7 +82,7 @@ class ActivityStore {
       this.data = defaultData();
     }
 
-    let changed = false;
+    let changed = malformed;
     for (const item of this.data.downloads) {
       if (ACTIVE_DOWNLOAD_STATES.has(item.state)) {
         item.state = 'interrupted';

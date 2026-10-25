@@ -207,7 +207,6 @@ function renderDownloads() {
     }
     if (entry.state === 'completed' && entry.exists) {
       actions.append(actionButton('Delete file', async () => {
-        if (!confirm(`Move “${entry.filename}” to the Recycle Bin and remove this record?`)) return;
         const result = await window.activityApi.trashDownload(entry.id);
         if (!result?.ok) showToast(result?.message || 'The file could not be deleted.');
       }, true));

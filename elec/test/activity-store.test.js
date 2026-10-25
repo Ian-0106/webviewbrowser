@@ -57,3 +57,17 @@ test('clearing terminal downloads preserves active work', () => {
     assert.equal(store.listDownloads()[0].filename, 'active.zip');
   });
 });
+
+test('valid JSON with malformed records is recovered without crashing the main process', () => {
+  withStore((store, filePath) => {
+    const valid = store.createDownload({ filename: 'kept.txt', state: 'completed' });
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    data.history.push(null, { id: 'bad-history', url: 'javascript:alert(1)' });
+    data.downloads.push(null, { ...valid, id: 'bad-path', savePath: 42 });
+    fs.writeFileSync(filePath, JSON.stringify(data));
+    const recovered = new ActivityStore(filePath);
+    assert.equal(recovered.listHistory().length, 0);
+    assert.deepEqual(recovered.listDownloads().map((entry) => entry.id), [valid.id]);
+    assert.ok(fs.readdirSync(path.dirname(filePath)).some((name) => name.includes('.corrupt-')));
+  });
+});

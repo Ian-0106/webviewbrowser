@@ -12,6 +12,7 @@
 #include <objbase.h>
 #include <roapi.h>
 #include <shellapi.h>
+#include <wrl.h>
 #include <algorithm>
 #include <cwctype>
 #include <filesystem>
@@ -27,7 +28,7 @@
 #endif
 
 #define APP_NAME    L"WebView Browser"
-#define APP_VERSION L"1.3.0"
+#define APP_VERSION L"1.3.1"
 
 #define IDM_ABOUT         1001
 #define IDM_HISTORY       1002
@@ -83,6 +84,7 @@ struct Tab {
     EventRegistrationToken navigationToken{};
     EventRegistrationToken downloadToken{};
     std::wstring lastHistoryId;
+    bool permissionsReady = false;
 };
 
 struct DownloadRuntime {
@@ -90,7 +92,6 @@ struct DownloadRuntime {
     ICoreWebView2DownloadOperation *operation = nullptr;
     EventRegistrationToken bytesToken{};
     EventRegistrationToken stateToken{};
-    bool paused = false;
     bool notified = false;
     std::int64_t lastPersistAt = 0;
 };
@@ -321,15 +322,89 @@ public:
            ICoreWebView2NewWindowRequestedEventArgs *args) override {
         std::wstring *target = nullptr;
         LPWSTR uri = nullptr;
-        if (SUCCEEDED(args->get_Uri(&uri)) && uri && uri[0] != L'\0') {
-            target = new std::wstring(uri);
+        if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
+            if (ActivityStore::IsWebUrl(uri)) target = new std::wstring(uri);
             CoTaskMemFree(uri);
         }
-        PostMessageW(g_mainWnd, WM_APP_NEWTAB, 0, (LPARAM)target);
+        if (target && !PostMessageW(g_mainWnd, WM_APP_NEWTAB, 0, (LPARAM)target)) delete target;
         args->put_Handled(TRUE);
         return S_OK;
     }
 };
+
+static void CompletePermissionPreparation(webview_t tab, HRESULT result) {
+    const int index = FindTabIndex(tab);
+    if (index < 0) return;
+    if (FAILED(result)) {
+        g_tabs[index].title = L"Permission reset failed - update WebView2";
+        if (g_tabStrip) RefreshTabStrip(true);
+        return;
+    }
+    g_tabs[index].permissionsReady = true;
+    if (!g_tabs[index].url.empty()) {
+        webview_navigate(tab, WideToUtf8(g_tabs[index].url).c_str());
+    }
+}
+
+struct PermissionRevocationBatch {
+    webview_t tab = nullptr;
+    unsigned pending = 1; // Enumeration holds a sentinel until every revoke is queued.
+    HRESULT result = S_OK;
+    Microsoft::WRL::ComPtr<ICoreWebView2Profile4> profile;
+
+    void FinishOne(HRESULT status) {
+        if (FAILED(status)) result = status;
+        if (--pending == 0) CompletePermissionPreparation(tab, result);
+    }
+};
+
+static void PreparePermissionSettings(webview_t tab, ICoreWebView2 *core) {
+    // A prior release may have persisted ALLOW and suppressed PermissionRequested.
+    // Revoke explicit grants before loading content; do not clear other profile data.
+    Microsoft::WRL::ComPtr<ICoreWebView2_13> extended;
+    Microsoft::WRL::ComPtr<ICoreWebView2Profile> profile;
+    auto batch = std::make_shared<PermissionRevocationBatch>();
+    batch->tab = tab;
+    HRESULT result = core->QueryInterface(IID_PPV_ARGS(&extended));
+    if (SUCCEEDED(result)) result = extended->get_Profile(&profile);
+    if (SUCCEEDED(result)) result = profile.As(&batch->profile);
+    if (SUCCEEDED(result)) {
+        auto completion = Microsoft::WRL::Callback<ICoreWebView2GetNonDefaultPermissionSettingsCompletedHandler>(
+            [batch](HRESULT status, ICoreWebView2PermissionSettingCollectionView *settings) -> HRESULT {
+                UINT32 count = 0;
+                if (SUCCEEDED(status)) status = settings ? settings->get_Count(&count) : E_POINTER;
+                for (UINT32 i = 0; SUCCEEDED(status) && i < count; ++i) {
+                    Microsoft::WRL::ComPtr<ICoreWebView2PermissionSetting> setting;
+                    COREWEBVIEW2_PERMISSION_STATE state = COREWEBVIEW2_PERMISSION_STATE_DEFAULT;
+                    status = settings->GetValueAtIndex(i, &setting);
+                    if (SUCCEEDED(status)) status = setting->get_PermissionState(&state);
+                    if (FAILED(status) || state != COREWEBVIEW2_PERMISSION_STATE_ALLOW) continue;
+                    COREWEBVIEW2_PERMISSION_KIND kind{};
+                    LPWSTR origin = nullptr;
+                    status = setting->get_PermissionKind(&kind);
+                    if (SUCCEEDED(status)) status = setting->get_PermissionOrigin(&origin);
+                    if (SUCCEEDED(status) && origin) {
+                        ++batch->pending;
+                        auto revoked = Microsoft::WRL::Callback<ICoreWebView2SetPermissionStateCompletedHandler>(
+                            [batch](HRESULT revokedStatus) -> HRESULT {
+                                batch->FinishOne(revokedStatus);
+                                return S_OK;
+                            });
+                        HRESULT queued = batch->profile->SetPermissionState(kind, origin,
+                            COREWEBVIEW2_PERMISSION_STATE_DENY, revoked.Get());
+                        if (FAILED(queued)) batch->FinishOne(queued);
+                    } else if (SUCCEEDED(status)) {
+                        status = E_POINTER;
+                    }
+                    if (origin) CoTaskMemFree(origin);
+                }
+                batch->FinishOne(status);
+                return S_OK;
+            });
+        result = batch->profile->GetNonDefaultPermissionSettings(completion.Get());
+    }
+    if (FAILED(result)) batch->FinishOne(result);
+}
 
 class DocumentTitleChangedHandler
     : public ComHandlerBase<ICoreWebView2DocumentTitleChangedEventHandler> {
@@ -633,8 +708,17 @@ static std::wstring DayGroupLabel(std::int64_t value) {
     return date;
 }
 
+static bool IsLocalAbsolutePath(const std::wstring &path) {
+    if (path.empty() || path.size() > 32768 || path.find(L'\0') != std::wstring::npos ||
+        path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/')) return false;
+    return true;
+}
+
 static bool FileExists(const std::wstring &path) {
-    return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!IsLocalAbsolutePath(path)) return false;
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
 }
 
 static void ShowDownloadNotification(const DownloadEntry &entry) {
@@ -662,6 +746,8 @@ static void ShowDownloadNotification(const DownloadEntry &entry) {
 
 static void UpdateDownloadOperation(const std::wstring &id,
                                     ICoreWebView2DownloadOperation *operation) {
+    // Removing COM event handlers may release their owning strings; retain our ID.
+    const std::wstring downloadId = id;
     DownloadEntry *entry = g_activityStore.FindDownload(id);
     DownloadRuntime *runtime = FindDownloadRuntime(id);
     if (!entry || !operation || !runtime) return;
@@ -673,21 +759,25 @@ static void UpdateDownloadOperation(const std::wstring &id,
         entry->filename = FileNameFromPath(entry->savePath);
         CoTaskMemFree(resultPath);
     }
+    const std::wstring previousState = entry->state;
     COREWEBVIEW2_DOWNLOAD_STATE state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
     if (SUCCEEDED(operation->get_State(&state))) {
-        if (runtime->paused) {
-            entry->state = L"paused";
-        } else if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
+        if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
             entry->state = L"completed";
         } else if (state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED) {
             COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NONE;
             operation->get_InterruptReason(&reason);
-            entry->state = reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED
-                               ? L"cancelled"
-                               : L"failed";
-            entry->interruptReason = L"WebView2 interruption code " + std::to_wstring(static_cast<int>(reason));
+            if (reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED) {
+                entry->state = L"paused";
+                entry->interruptReason.clear();
+            } else {
+                entry->state = reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED
+                                   ? L"cancelled" : L"failed";
+                entry->interruptReason = L"WebView2 interruption code " + std::to_wstring(static_cast<int>(reason));
+            }
         } else {
             entry->state = L"progressing";
+            entry->interruptReason.clear();
         }
     }
     const bool isActive = ActivityStore::IsActiveDownloadState(entry->state);
@@ -695,7 +785,7 @@ static void UpdateDownloadOperation(const std::wstring &id,
         entry->finishedAt = ActivityStore::NowMilliseconds();
     }
     const std::int64_t now = ActivityStore::NowMilliseconds();
-    if (isActive && runtime->lastPersistAt && now - runtime->lastPersistAt < 250) {
+    if (isActive && previousState == entry->state && runtime->lastPersistAt && now - runtime->lastPersistAt < 250) {
         return;
     }
     runtime->lastPersistAt = now;
@@ -706,13 +796,13 @@ static void UpdateDownloadOperation(const std::wstring &id,
         ShowDownloadNotification(*entry);
     }
     if (g_activityWnd) PostMessageW(g_activityWnd, WM_APP_ACTIVITY_REFRESH, 0, 0);
-    InvalidateRect(g_toolbar, nullptr, FALSE);
+    if (g_toolbar) InvalidateRect(g_toolbar, nullptr, FALSE);
     if (!isActive) {
         operation->remove_BytesReceivedChanged(runtime->bytesToken);
         operation->remove_StateChanged(runtime->stateToken);
         operation->Release();
         runtime->operation = nullptr;
-        g_downloadRuntime.erase(id);
+        g_downloadRuntime.erase(downloadId);
     }
 }
 
@@ -845,12 +935,15 @@ enum class DownloadAction { Open, Folder, PauseResume, Cancel, Retry, DeleteReco
 static void PerformDownloadAction(const std::wstring &id, DownloadAction action) {
     DownloadEntry *entry = g_activityStore.FindDownload(id);
     if (!entry) return;
+    // A modal dialog pumps download callbacks, which can reallocate store vectors.
+    DownloadEntry snapshot = *entry;
+    entry = &snapshot;
     DownloadRuntime *runtime = FindDownloadRuntime(id);
     if (action == DownloadAction::Open) {
-        if (FileExists(entry->savePath)) ShellExecuteW(g_activityWnd, L"open", entry->savePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (entry->state == L"completed" && FileExists(entry->savePath)) ShellExecuteW(g_activityWnd, L"open", entry->savePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         else MessageBoxW(g_activityWnd, L"The downloaded file no longer exists.", L"Downloads", MB_OK | MB_ICONINFORMATION);
     } else if (action == DownloadAction::Folder) {
-        if (entry->savePath.empty()) return;
+        if (!IsLocalAbsolutePath(entry->savePath)) return;
         if (FileExists(entry->savePath)) {
             std::wstring argument = L"/select,\"" + entry->savePath + L"\"";
             ShellExecuteW(g_activityWnd, L"open", L"explorer.exe", argument.c_str(), nullptr, SW_SHOWNORMAL);
@@ -858,16 +951,19 @@ static void PerformDownloadAction(const std::wstring &id, DownloadAction action)
             ShellExecuteW(g_activityWnd, L"open", std::filesystem::path(entry->savePath).parent_path().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
     } else if (action == DownloadAction::PauseResume && runtime && runtime->operation) {
-        if (runtime->paused) {
-            if (SUCCEEDED(runtime->operation->Resume())) runtime->paused = false;
-        } else {
+        // Pause/Resume may synchronously invoke StateChanged and remove runtime.
+        Microsoft::WRL::ComPtr<ICoreWebView2DownloadOperation> operation = runtime->operation;
+        if (entry->state == L"paused") {
             BOOL canResume = FALSE;
-            runtime->operation->get_CanResume(&canResume);
-            if (canResume && SUCCEEDED(runtime->operation->Pause())) runtime->paused = true;
+            operation->get_CanResume(&canResume);
+            if (canResume) operation->Resume();
+        } else {
+            operation->Pause();
         }
-        UpdateDownloadOperation(id, runtime->operation);
+        UpdateDownloadOperation(id, operation.Get());
     } else if (action == DownloadAction::Cancel && runtime && runtime->operation) {
-        runtime->operation->Cancel();
+        Microsoft::WRL::ComPtr<ICoreWebView2DownloadOperation> operation = runtime->operation;
+        operation->Cancel();
     } else if (action == DownloadAction::Retry) {
         if (!ActivityStore::IsWebUrl(entry->url)) {
             MessageBoxW(g_activityWnd, L"This download source is not a valid web address.",
@@ -879,10 +975,14 @@ static void PerformDownloadAction(const std::wstring &id, DownloadAction action)
     } else if (action == DownloadAction::DeleteRecord) {
         g_activityStore.RemoveDownloads({id}, true);
     } else if (action == DownloadAction::DeleteFile) {
+        if (ActivityStore::IsActiveDownloadState(entry->state)) return;
         if (!FileExists(entry->savePath)) {
             MessageBoxW(g_activityWnd, L"The downloaded file no longer exists.", L"Downloads", MB_OK | MB_ICONINFORMATION);
         } else if (MessageBoxW(g_activityWnd, L"Move this file to the Recycle Bin and remove its download record?",
                                L"Delete downloaded file", MB_YESNO | MB_ICONWARNING) == IDYES) {
+            const DownloadEntry *current = g_activityStore.FindDownload(id);
+            if (!current || current->savePath != entry->savePath ||
+                ActivityStore::IsActiveDownloadState(current->state) || !FileExists(entry->savePath)) return;
             std::wstring from = entry->savePath;
             from.push_back(L'\0');
             SHFILEOPSTRUCTW operation{};
@@ -896,6 +996,20 @@ static void PerformDownloadAction(const std::wstring &id, DownloadAction action)
         }
     }
     RefreshActivityWindow();
+}
+
+static void CancelActiveDownloads() {
+    // Cancel can synchronously remove entries from the runtime map.
+    std::vector<std::wstring> activeIds;
+    for (const auto &[id, runtime] : g_downloadRuntime) activeIds.push_back(id);
+    for (const auto &id : activeIds) {
+        DownloadRuntime *runtime = FindDownloadRuntime(id);
+        DownloadEntry *entry = g_activityStore.FindDownload(id);
+        if (entry && ActivityStore::IsActiveDownloadState(entry->state) && runtime && runtime->operation) {
+            Microsoft::WRL::ComPtr<ICoreWebView2DownloadOperation> operation = runtime->operation;
+            operation->Cancel();
+        }
+    }
 }
 
 static void UpdateDownloadButtons() {
@@ -1616,13 +1730,11 @@ static void CreateTab(const std::wstring &url) {
                 core4->Release();
             }
 
+            PreparePermissionSettings(tab.w, core);
             core->Release();
         }
     }
 
-    if (!url.empty()) {
-        webview_navigate(tab.w, WideToUtf8(url).c_str());
-    }
     ActivateTab(idx);
 }
 
@@ -1716,7 +1828,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!u.empty() && g_activeTab >= 0 &&
                 g_activeTab < (int)g_tabs.size()) {
                 g_tabs[g_activeTab].url = u;
-                webview_navigate(g_tabs[g_activeTab].w, WideToUtf8(u).c_str());
+                if (g_tabs[g_activeTab].permissionsReady) {
+                    webview_navigate(g_tabs[g_activeTab].w, WideToUtf8(u).c_str());
+                }
                 SetWindowTextW(g_addressEdit, u.c_str());
             }
         } else if (id == ID_PLUS) {
@@ -1780,11 +1894,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ShowWindow(hwnd, SW_SHOW);
             if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
-            if (entry && action == L"open" && FileExists(entry->savePath)) {
+            if (entry && entry->state == L"completed" && action == L"open" && FileExists(entry->savePath)) {
                 ShellExecuteW(hwnd, L"open", entry->savePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            } else if (entry && action == L"retry") {
-                g_pendingRetries[entry->url].push_back(entry->id);
-                CreateTab(entry->url);
+            } else if (entry && action == L"retry" && ActivityStore::IsWebUrl(entry->url) &&
+                       !ActivityStore::IsActiveDownloadState(entry->state)) {
+                PerformDownloadAction(id, DownloadAction::Retry);
             } else {
                 OpenActivityWindow(true, entry ? id : L"");
             }
@@ -1800,13 +1914,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             g_allowClose = true;
-            for (auto &[id, runtime] : g_downloadRuntime) {
-                DownloadEntry *entry = g_activityStore.FindDownload(id);
-                if (entry && ActivityStore::IsActiveDownloadState(entry->state) &&
-                    runtime->operation) {
-                    runtime->operation->Cancel();
-                }
-            }
+            CancelActiveDownloads();
         }
         while (!g_tabs.empty()) {
             webview_destroy(g_tabs[0].w);

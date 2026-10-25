@@ -3661,12 +3661,14 @@ public:
   HRESULT STDMETHODCALLTYPE
   Invoke(ICoreWebView2 * /*sender*/,
          ICoreWebView2PermissionRequestedEventArgs *args) {
-    COREWEBVIEW2_PERMISSION_KIND kind;
-    args->get_PermissionKind(&kind);
-    if (kind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ) {
-      args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+    // Remote tabs must not silently gain access to clipboard, camera or location.
+    // Keep user-initiated keyboard paste separate from the website permission API.
+    ICoreWebView2PermissionRequestedEventArgs3 *extended = nullptr;
+    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&extended))) && extended) {
+      extended->put_SavesInProfile(FALSE);
+      extended->Release();
     }
-    return S_OK;
+    return args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
   }
 
   // Set the function that will perform the initiating logic for creating

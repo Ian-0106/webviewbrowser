@@ -1,13 +1,14 @@
 {
   "name": "webview-browser-electron",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Electron implementation of the WebView Browser sample",
   "main": "main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
     "test": "node --test",
-    "check": "node --check main.js && node --check preload.js && node --check renderer/renderer.js && node --test",
+    "test:security": "electron verification/security-smoke.cjs",
+    "check": "node --check main.js && node --check preload.js && node --check activity-preload.js && node --check renderer/renderer.js && node --check renderer/activity.js && node --test",
     "build:win": "electron-builder --win nsis portable --x64"
   },
   "devDependencies": {
@@ -24,6 +25,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "activity-preload.js",
       "renderer/**/*",
       "src/**/*",
       "package.json"
